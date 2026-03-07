@@ -1,0 +1,21 @@
+# Agentic Supply Chain Layer - Dependencies
+# Core simulation & ML
+torch>=2.1.0
+torch-geometric>=2.4.0
+simpy>=4.1.1
+networkx>=3.2
+numpy>=1.26.0
+
+# LLM + Agent framework
+langchain>=0.3.0
+langchain-google-genai>=2.0.0
+langgraph>=0.2.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# Streamlit frontend
+streamlit>=1.40.0
+plotly>=5.24.0
+
+# CLI fallback
+rich>=13.7.0

@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile supply_chain/environment.py)",
+      "Bash(python -m py_compile supply_chain/gnn_model.py)",
+      "Bash(python -m py_compile supply_chain/agent.py)",
+      "Bash(python -m py_compile supply_chain/guardrails.py)",
+      "Bash(python -m py_compile supply_chain/dashboard.py)",
+      "Bash(python -m py_compile main.py)",
+      "Bash(wc -l supply_chain/*.py main.py)",
+      "Bash(pip install torch torch-geometric simpy networkx numpy rich --quiet)",
+      "Bash(python -c \"import torch; import torch_geometric; import simpy; import rich; print\\(''torch:'', torch.__version__\\); print\\(''torch_geometric:'', torch_geometric.__version__\\); print\\(''simpy: OK''\\); print\\(''rich: OK''\\)\")",
+      "Bash(python main.py --auto-approve --ticks 20 --fail-node HUB-NYC --fail-tick 3 --severity 0.85 --delay 0)",
+      "Bash(set PYTHONIOENCODING=utf-8)",
+      "Bash(python -c \":*)",
+      "Bash(python -c \"import sys; [print\\(l.encode\\(''ascii'',''replace''\\).decode\\(\\)\\) for l in sys.stdin]\")"
+    ]
+  }
+}
