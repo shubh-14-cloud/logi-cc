@@ -28,6 +28,7 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Tuple
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -326,3 +327,26 @@ def propagate_blast_radius(
         final[nid] = blend_alpha * gnn_score + (1.0 - blend_alpha) * propagated.get(nid, 0.5)
 
     return final
+
+
+# ─── Weight Initialisation Helper ──────────────────────────────────────────────
+
+def initialise_gnn_weights(
+    model: "STGATBlastRadiusModel",
+    prefer_trained: bool = True,
+    weight_path: str = "trained_gnn_weights.pt",
+) -> None:
+    """
+    Initialise ST-GAT weights.
+
+    If `prefer_trained` is True and a trained weight file exists, load it.
+    Otherwise fall back to the heuristic `demo_warm_init()` so the model
+    still produces meaningful scores without training.
+    """
+    if prefer_trained and os.path.exists(weight_path):
+        state = torch.load(weight_path, map_location="cpu")
+        model.load_state_dict(state)
+    else:
+        model.demo_warm_init()
+
+

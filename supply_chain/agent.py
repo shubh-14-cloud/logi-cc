@@ -34,6 +34,9 @@ from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 
+import chromadb
+from chromadb.utils import embedding_functions
+
 
 load_dotenv()
 
@@ -66,6 +69,7 @@ class ThoughtStep:
     action:        AgentAction
     action_params: Dict[str, Any]
     timestamp:     float = field(default_factory=time.time)
+    memory_recall_hit: bool = False      # did the LLM use long-term memory?
 
     @property
     def reasoning(self) -> str:
@@ -133,7 +137,85 @@ class LLMState(TypedDict, total=False):
     observation: str
     risk_scores: Dict[str, float]
     env_snapshot: dict
+    memory_context: str
+    memory_hit: bool
     decision: AgentDecision
+
+
+# ─── Long-Term Memory (ChromaDB) ───────────────────────────────────────────────
+
+
+class LongTermMemory:
+    """
+    Simple Chroma-backed vector store for long-term agent memory.
+
+    Each memory record captures:
+      • observation
+      • decision + action
+      • first CoT step
+      • tool result message (if any)
+    """
+
+    def __init__(self, persist_dir: str = "memory/chroma") -> None:
+        os.makedirs(persist_dir, exist_ok=True)
+        client = chromadb.PersistentClient(path=persist_dir)
+        embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name="all-MiniLM-L6-v2"
+        )
+        self.collection = client.get_or_create_collection(
+            name="agent_long_term_memory",
+            embedding_function=embed_fn,
+        )
+
+    def add_memory(self, thought: ThoughtStep, result: Optional[Dict[str, Any]]) -> None:
+        summary_parts = [
+            f"OBS: {thought.observation}",
+            f"DECISION: {thought.decision}",
+        ]
+        if thought.chain_of_thought:
+            summary_parts.append(f"FIRST_STEP: {thought.chain_of_thought[0]}")
+        if result and isinstance(result, dict):
+            msg = result.get("message") or str(result)
+            summary_parts.append(f"RESULT: {msg}")
+
+        doc = " | ".join(summary_parts)
+        metadata = {
+            "tick": thought.tick,
+            "action": thought.action.value,
+        }
+
+        try:
+            self.collection.add(
+                ids=[f"tick-{thought.tick}-{int(thought.timestamp)}"],
+                documents=[doc],
+                metadatas=[metadata],
+            )
+        except Exception:
+            # Fail silently; long-term memory should never break the agent
+            return
+
+    def search(self, query: str, k: int = 3) -> List[Dict[str, Any]]:
+        try:
+            res = self.collection.query(
+                query_texts=[query],
+                n_results=k,
+            )
+        except Exception:
+            return []
+
+        docs = res.get("documents", [[]])[0]
+        metas = res.get("metadatas", [[]])[0]
+        results: List[Dict[str, Any]] = []
+        for doc, meta in zip(docs, metas):
+            m = meta or {}
+            results.append(
+                {
+                    "summary": doc,
+                    "tick": m.get("tick"),
+                    "action": m.get("action"),
+                }
+            )
+        return results
 
 
 # ─── Tool Implementations ──────────────────────────────────────────────────────
@@ -313,6 +395,11 @@ class SupplyChainAgent:
         self._llm = None
         self._llm_structured = None
         self._planner_graph = None
+        # Long-term memory (ChromaDB-backed) for RAG over past incidents
+        try:
+            self.ltm = LongTermMemory()
+        except Exception:
+            self.ltm = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -418,7 +505,7 @@ class SupplyChainAgent:
 
         # Low-temperature, deterministic-ish logistics planner
         self._llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-pro",
+            model="gemini-2.5-flash",
             temperature=0.2,
             max_output_tokens=1024,
         )
@@ -433,6 +520,8 @@ class SupplyChainAgent:
             risk_scores = state["risk_scores"]
             env_snapshot = state["env_snapshot"]
             tick = state["tick"]
+            memory_context = state.get("memory_context", "")
+            memory_hit = state.get("memory_hit", False)
 
             # Build a compact, model-friendly risk report
             nodes = env_snapshot["nodes"]
@@ -451,6 +540,11 @@ class SupplyChainAgent:
 
             risk_report = "\n".join(top_rows) or "No nodes available."
             failed_str = ", ".join(failed) if failed else "none"
+
+            # Enumerate all valid hubs to minimise hallucinations
+            hub_catalog = "\n".join(
+                f"- {nid} ({nodes[nid].name})" for nid in nodes.keys()
+            )
 
             prompt = (
                 "You are an autonomous logistics incident-response agent operating a "
@@ -475,16 +569,23 @@ class SupplyChainAgent:
                 f"Failed hubs: {failed_str}\n"
                 "Top risk report (highest first):\n"
                 f"{risk_report}\n\n"
+                "Valid hubs in this network (you MUST NOT invent other cities or hub IDs):\n"
+                f"{hub_catalog}\n\n"
+                "Relevant past incidents (if any):\n"
+                f"{memory_context or 'No strongly similar past incidents found.'}\n\n"
                 "Optimise for protecting downstream customer promise while keeping cost "
                 "and blast radius under control. Prefer 'continue_monitoring' when all "
                 "risks are nominal. Prefer 'request_human_intervention' when the blast "
-                "radius or cost is very high and you are uncertain."
+                "radius or cost is very high and you are uncertain. Always choose "
+                "`target_node_id` from the valid hub IDs listed above; never invent "
+                "new hub IDs or city names."
             )
 
             decision = self._llm_structured.invoke(prompt)
             return {
                 **state,
                 "decision": decision,
+                "memory_hit": memory_hit,
             }
 
         graph.add_node("decide", decide_node)
@@ -501,17 +602,35 @@ class SupplyChainAgent:
         """Run one LangGraph LLM planning cycle and return the structured decision."""
         self._ensure_llm_planner()
 
+        # Retrieve relevant long-term memories (if enabled)
+        memory_context = ""
+        memory_hit = False
+        if hasattr(self, "ltm") and isinstance(getattr(self, "ltm"), LongTermMemory):
+            memories = self.ltm.search(observation, k=3)
+            if memories:
+                memory_hit = True
+                memory_lines = []
+                for m in memories:
+                    memory_lines.append(
+                        f"- [tick {m.get('tick')}] action={m.get('action')}: {m.get('summary')}"
+                    )
+                memory_context = "\n".join(memory_lines)
+
         out: LLMState = self._planner_graph.invoke(
             {
                 "tick": self._tick,
                 "observation": observation,
                 "risk_scores": risk_scores,
                 "env_snapshot": env_state,
+                "memory_context": memory_context,
+                "memory_hit": memory_hit,
             }
         )
         decision = out.get("decision")
         if decision is None:
             raise RuntimeError("LLM planner returned no decision.")
+        # Propagate memory_hit flag back to the ThoughtStep
+        setattr(self, "_last_memory_hit", out.get("memory_hit", False))
         return decision
 
     def _decision_to_thought(
@@ -543,9 +662,10 @@ class SupplyChainAgent:
             action = AgentAction.MONITOR
 
         nodes = env_state["nodes"]
-        target_id = decision.target_node_id or (
-            max(risk_scores, key=risk_scores.get) if risk_scores else None
-        )
+        # Snap invalid or missing target_node_id back to a real hub from the risk report
+        target_id = decision.target_node_id
+        if not target_id or target_id not in risk_scores:
+            target_id = max(risk_scores, key=risk_scores.get) if risk_scores else None
         target_name = (
             nodes[target_id].name if target_id and target_id in nodes else target_id
         )
@@ -594,6 +714,8 @@ class SupplyChainAgent:
             action_params = {}
             decision_text = decision.justification or "System nominal. No action taken."
 
+        memory_hit = bool(getattr(self, "_last_memory_hit", False))
+
         thought = ThoughtStep(
             tick=self._tick,
             observation=observation,
@@ -601,6 +723,7 @@ class SupplyChainAgent:
             decision=decision_text,
             action=action,
             action_params=action_params,
+            memory_recall_hit=memory_hit,
         )
         self.memory.thought_log.append(thought)
         return thought
@@ -803,6 +926,10 @@ class SupplyChainAgent:
         if result:
             # Log last action outcome so future reasoning can reference it
             self.memory.risk_snapshots = self.memory.risk_snapshots[-20:]  # keep last 20
+
+            # Append to long-term memory store (if configured)
+            if hasattr(self, "ltm") and isinstance(getattr(self, "ltm"), LongTermMemory):
+                self.ltm.add_memory(thought, result)
 
     def _idle_step(self, observation: str) -> ThoughtStep:
         return ThoughtStep(

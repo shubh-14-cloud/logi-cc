@@ -10,7 +10,11 @@ import streamlit as st
 import plotly.graph_objects as go
 
 from supply_chain.environment import LogisticsEnvironment
-from supply_chain.gnn_model import STGATBlastRadiusModel, propagate_blast_radius
+from supply_chain.gnn_model import (
+    STGATBlastRadiusModel,
+    propagate_blast_radius,
+    initialise_gnn_weights,
+)
 from supply_chain.agent import SupplyChainAgent, AgentAction
 from supply_chain.guardrails import GuardrailLayer, COST_APPROVAL_USD
 from supply_chain.hub_coords import HUB_GEO, HUB_ROUTES, risk_to_hex, risk_label
@@ -25,7 +29,7 @@ st.set_page_config(
 # ─── Session-scoped initialisation ─────────────────────────────────────────────
 
 
-def init_simulation(seed: int = 42) -> None:
+def init_simulation(seed: int = 42, use_trained_gnn: bool = True) -> None:
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -40,7 +44,8 @@ def init_simulation(seed: int = 42) -> None:
         dropout=0.10,
     )
     model.eval()
-    model.demo_warm_init()
+    # Load trained weights when available (or fall back to heuristic warm-start)
+    initialise_gnn_weights(model, prefer_trained=use_trained_gnn)
 
     total_volume = sum(n.incoming_volume for n in env.nodes.values())
     guardrail = GuardrailLayer(
@@ -62,10 +67,12 @@ def init_simulation(seed: int = 42) -> None:
     st.session_state["last_cycle"] = None
     st.session_state["pending_action"] = None
     st.session_state["tick"] = 0
+    st.session_state["use_trained_gnn"] = use_trained_gnn
 
 
 if "env" not in st.session_state:
-    init_simulation()
+    # Default to using trained weights if available
+    init_simulation(use_trained_gnn=True)
 
 
 # ─── Sidebar Controls ──────────────────────────────────────────────────────────
@@ -85,12 +92,20 @@ with st.sidebar:
     ) or None
 
     st.markdown("---")
+    gnn_mode = st.radio(
+        "GNN Weight Mode",
+        options=["Use Trained GNN Weights", "Use Heuristic Weights"],
+        index=0,
+    )
+    use_trained_gnn = gnn_mode == "Use Trained GNN Weights"
+
+    st.markdown("---")
     seed = st.number_input("Random seed", min_value=0, max_value=2**31 - 1, value=42)
 
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
         if st.button("Reset Simulation", use_container_width=True):
-            init_simulation(seed=seed)
+            init_simulation(seed=seed, use_trained_gnn=use_trained_gnn)
             st.rerun()
     with col_btn2:
         next_tick_clicked = st.button("Next Tick ▶", use_container_width=True)
@@ -157,13 +172,15 @@ def run_agent_tick() -> None:
     observation = agent._observe(risk_scores, env_state)
     thought = agent._reason(observation, risk_scores, env_state)
 
-    # Check cost threshold for human approval
+    # Check whether we need to pause for human approval
     est_cost = float(thought.action_params.get("estimated_cost", 0.0))
-    requires_approval = (
-        thought.action not in (AgentAction.MONITOR,) and est_cost > COST_APPROVAL_USD
+    requires_cost_approval = (
+        thought.action not in (AgentAction.MONITOR,)
+        and est_cost > COST_APPROVAL_USD
     )
+    requires_human_tool = thought.action == AgentAction.HUMAN_INTERVENTION
 
-    if requires_approval:
+    if requires_cost_approval or requires_human_tool:
         st.session_state["pending_action"] = {
             "tick": tick,
             "thought": thought,
@@ -171,16 +188,21 @@ def run_agent_tick() -> None:
             "risk_scores": risk_scores,
             "estimated_cost": est_cost,
         }
+        if requires_human_tool:
+            guardrail_msg = "Agent requested human intervention; awaiting operator decision."
+        else:
+            guardrail_msg = (
+                f"Awaiting human approval for high-cost action "
+                f"(${est_cost:.0f} > ${COST_APPROVAL_USD:.0f})."
+            )
+
         st.session_state["last_cycle"] = {
             "tick": tick,
             "risk_scores": risk_scores,
             "thought": thought,
             "result": None,
             "guardrail_triggered": True,
-            "guardrail_message": (
-                f"Awaiting human approval for high-cost action "
-                f"(${est_cost:.0f} > ${COST_APPROVAL_USD:.0f})."
-            ),
+            "guardrail_message": guardrail_msg,
         }
     else:
         # Safe to execute immediately via the normal guardrail layer
@@ -207,16 +229,33 @@ pending = st.session_state.get("pending_action")
 
 
 if pending:
-    with st.expander("⚠ Human Approval Required — High-Cost Action", expanded=True):
+    thought = pending["thought"]
+    est_cost = pending["estimated_cost"]
+    tick = pending["tick"]
+    is_human_tool = thought.action == AgentAction.HUMAN_INTERVENTION
+
+    title = (
+        "👤 Human Intervention Requested — Approve Escalation"
+        if is_human_tool
+        else "⚠ Human Approval Required — High-Cost Action"
+    )
+
+    with st.expander(title, expanded=True):
         thought = pending["thought"]
         est_cost = pending["estimated_cost"]
         tick = pending["tick"]
 
-        st.markdown(
-            f"**Proposed action (tick {tick}):** `{thought.action.value}`  \n"
-            f"**Estimated incremental cost:** `${est_cost:,.0f}`  \n"
-            f"**Policy threshold:** `${COST_APPROVAL_USD:,.0f}`"
-        )
+        if is_human_tool:
+            st.markdown(
+                f"**Agent has requested human intervention on tick {tick}.**  \n"
+                f"Proposed escalation action: `{thought.action.value}`"
+            )
+        else:
+            st.markdown(
+                f"**Proposed action (tick {tick}):** `{thought.action.value}`  \n"
+                f"**Estimated incremental cost:** `${est_cost:,.0f}`  \n"
+                f"**Policy threshold:** `${COST_APPROVAL_USD:,.0f}`"
+            )
 
         st.markdown("**LLM Justification**")
         st.info(thought.decision)
@@ -248,14 +287,22 @@ if pending:
             # Treat this as an explicit manual override — no reroute executed.
             from supply_chain.agent import trigger_manual_override
 
+            override_reason = (
+                "Operator declined LLM escalation request; handling manually."
+                if is_human_tool
+                else "Operator declined high-cost autonomous action."
+            )
+            override_context = {
+                "tick": tick,
+                "proposed_action": thought.action.value,
+                "proposed_params": thought.action_params,
+            }
+            if not is_human_tool:
+                override_context["estimated_cost"] = est_cost
+
             override_result = trigger_manual_override(
-                reason="Operator declined high-cost autonomous action.",
-                context={
-                    "tick": tick,
-                    "proposed_action": thought.action.value,
-                    "proposed_params": thought.action_params,
-                    "estimated_cost": est_cost,
-                },
+                reason=override_reason,
+                context=override_context,
             )
 
             st.session_state["last_cycle"] = {
@@ -400,6 +447,12 @@ with col_right:
             f"params={t.action_params if t.action_params else '{}'}"
         )
         terminal_area.markdown("\n\n".join(lines))
+
+        # Long-term memory indicator (blue info block)
+        if getattr(t, "memory_recall_hit", False):
+            st.info("Long-term memory: similar past incidents recalled from ChromaDB.")
+        else:
+            st.caption("Long-term memory: no strongly similar incidents found this tick.")
     else:
         terminal_area.info("Awaiting first agent cycle...")
 
